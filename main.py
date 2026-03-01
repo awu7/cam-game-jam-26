@@ -5,18 +5,132 @@ import pygame
 import random
 
 TILE = 128
-COLS, ROWS = 18, 14
+COLS, ROWS = 19, 14
 FLOOR_TILE = 16
 # Per-level grid dimensions (cols, rows), inferred from floor images at 16px/tile
 LEVEL_DIMS = {
-    0: (18, 14),  # floor1-l1: 288x224
+    0: (19, 14),  # floor1-l1: 304x224
     1: (16, 13),  # floor1-l2: 256x208
-    2: (14, 11),  # floor2-l1: 224x176
+    2: (15, 11),  # floor2-l1: 240x176
     3: (13, 10),  # floor2-l2: 208x160
-    4: (13, 13),  # Floor3: 208x208
+    4: (16, 13),  # floor3: 256x208
 }
+# Per-level player spawn position (col, row)
+PLAYER_SPAWN = {0: (1, 4), 1: (1, 6), 2: (1, 5), 3: (1, 6), 4: (1, 6)}
+
+# Per-level passability grids as strings. '.' = passable, '#' = wall.
+# Each string is one row (top to bottom). Edit manually.
+PASSABILITY_STR = {
+    0: [  # 19x14
+        "###################",
+        "###################",
+        "###......##########",
+        "#........##########",
+        "#........###....###",
+        "###......###....###",
+        "###.............###",
+        "######............#",
+        "######............#",
+        "######............#",
+        "######..........###",
+        "######..........###",
+        "###################",
+        "###################",
+    ],
+    1: [  # 16x13
+        "################",
+        "################",
+        "###....##....###",
+        "###....##....###",
+        "###....##....###",
+        "#..............#",
+        "#..............#",
+        "#......##......#",
+        "###....##....###",
+        "###....##....###",
+        "###....##....###",
+        "################",
+        "################",
+    ],
+    2: [  # 15x11
+        "###############",
+        "###############",
+        "##...###....###",
+        "##...###....###",
+        "#............##",
+        "#............##",
+        "##...###......#",
+        "##...###......#",
+        "##########...##",
+        "##########...##",
+        "###############",
+    ],
+    3: [  # 13x10
+        "#############",
+        "#############",
+        "##.........##",
+        "##.........##",
+        "##...###....#",
+        "#....###....#",
+        "#....###...##",
+        "##.........##",
+        "##.........##",
+        "#############",
+    ],
+    4: [  # 16x13
+        "################",
+        "###............#",
+        "##.............#",
+        "#..............#",
+        "#..............#",
+        "......####......",
+        ".....######.....",
+        "......####......",
+        "#..............#",
+        "#..............#",
+        "##.............#",
+        "###............#",
+        "################",
+    ],
+}
+PASSABILITY = {
+    lvl: [[1 if c == '.' else 0 for c in row] for row in rows]
+    for lvl, rows in PASSABILITY_STR.items()
+}
+
 EASE_SPEED = 20
 DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+
+
+_current_level = 0
+
+def is_passable(x, y, level=None):
+    """Check if tile (x, y) is within bounds and passable for the current level."""
+    if not (0 <= x < COLS and 0 <= y < ROWS):
+        return False
+    p = PASSABILITY.get(level if level is not None else _current_level)
+    if p and 0 <= y < len(p) and 0 <= x < len(p[y]):
+        return p[y][x] == 1
+    return True
+
+
+def bfs_distance(target_x, target_y, level):
+    """BFS distance map from (target_x, target_y). Returns dict {(x,y): dist}.
+    Only traverses passable tiles."""
+    from collections import deque
+    dist = {}
+    q = deque()
+    dist[(target_x, target_y)] = 0
+    q.append((target_x, target_y))
+    while q:
+        cx, cy = q.popleft()
+        d = dist[(cx, cy)]
+        for dx, dy in DIRS:
+            nx, ny = cx + dx, cy + dy
+            if (nx, ny) not in dist and is_passable(nx, ny, level):
+                dist[(nx, ny)] = d + 1
+                q.append((nx, ny))
+    return dist
 
 ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
 _sprite_cache = {}
@@ -35,12 +149,15 @@ def preload_sfx():
 
 def play_sfx(name, volume=0.5):
     """Play a sound effect by filename (cached). Returns the Channel."""
-    if name not in _sound_cache:
-        path = os.path.join(ASSET_DIR, name)
-        _sound_cache[name] = pygame.mixer.Sound(path)
-    snd = _sound_cache[name]
-    snd.set_volume(volume)
-    return snd.play()
+    try:
+        if name not in _sound_cache:
+            path = os.path.join(ASSET_DIR, name)
+            _sound_cache[name] = pygame.mixer.Sound(path)
+        snd = _sound_cache[name]
+        snd.set_volume(volume)
+        return snd.play()
+    except Exception:
+        return None
 
 
 def load_sprite(filename, flip_x=False, scale=1):
@@ -273,6 +390,8 @@ class Player(Entity):
     def try_move(self, gx, gy):
         dx, dy = gx - self.gx, gy - self.gy
         if max(abs(dx), abs(dy)) != 1:
+            return False
+        if not is_passable(gx, gy):
             return False
         if self.mode == "shield":
             di = direction_index(dx, dy)
@@ -559,7 +678,7 @@ class Slime(Entity):
     def overlay_color(self):
         return (100, 200, 80, 40)
 
-    def take_turn(self, game, occupied):
+    def take_turn(self, game, occupied, dist_map=None):
         px, py = game.player.gx, game.player.gy
         dist_sq = (self.gx - px) ** 2 + (self.gy - py) ** 2
         # Can we land on the player? (within jump range)
@@ -572,10 +691,10 @@ class Slime(Entity):
             best_d = 999
             for dx, dy in DIRS:
                 nx, ny = px + dx, py + dy
-                if 0 <= nx < COLS and 0 <= ny < ROWS and (nx, ny) not in occupied:
+                if is_passable(nx, ny) and (nx, ny) not in occupied:
                     jsq = (nx - self.gx) ** 2 + (ny - self.gy) ** 2
                     if jsq <= self.JUMP_RANGE_SQ:  # must be reachable by the jump
-                        pd = (nx - px) ** 2 + (ny - py) ** 2
+                        pd = dist_map.get((nx, ny), 9999) if dist_map else 9999
                         if pd < best_d:
                             best_d = pd
                             best = (nx, ny)
@@ -584,17 +703,19 @@ class Slime(Entity):
                 self.gx, self.gy = best
             self._start_jump(toward=(px, py))
             return
-        # Otherwise jump toward the player
+        # Otherwise jump toward the player using BFS distance
         best = None
-        best_dist = dist_sq
+        best_dist = dist_map.get((self.gx, self.gy), 9999) if dist_map else dist_sq
         for x in range(COLS):
             for y in range(ROWS):
+                if not is_passable(x, y):
+                    continue
                 jsq = (x - self.gx) ** 2 + (y - self.gy) ** 2
                 if jsq < 1 or jsq > self.JUMP_RANGE_SQ:
                     continue
                 if (x, y) in occupied or (x == px and y == py):
                     continue
-                d = (x - px) ** 2 + (y - py) ** 2
+                d = dist_map.get((x, y), 9999) if dist_map else (x - px) ** 2 + (y - py) ** 2
                 if d < best_dist:
                     best_dist = d
                     best = (x, y)
@@ -750,7 +871,7 @@ class Wizard(Entity):
     def overlay_color(self):
         return (120, 60, 180, 40)
 
-    def take_turn(self, game, occupied):
+    def take_turn(self, game, occupied, dist_map=None):
         px, py = game.player.gx, game.player.gy
         dist_sq = (self.gx - px) ** 2 + (self.gy - py) ** 2
 
@@ -761,7 +882,7 @@ class Wizard(Entity):
             # If too close, flee instead of casting — unless hex would kill
             would_kill = game.player.hp <= self.DAMAGE
             if too_close and not would_kill:
-                self._try_flee(game, occupied)
+                self._try_flee(game, occupied, dist_map)
                 self.cooldown = 1
                 return
             # Cast Hex — defer projectile until frame 4
@@ -795,7 +916,7 @@ class Wizard(Entity):
         if in_range and self.cooldown >= 1:
             # If too close, flee instead of casting fireball
             if too_close:
-                self._try_flee(game, occupied)
+                self._try_flee(game, occupied, dist_map)
                 self.cooldown = 0
                 return
             # Cast Fireball — defer projectile until frame 4
@@ -838,7 +959,7 @@ class Wizard(Entity):
             return
 
         # Not in range — move closer
-        self._move_toward(game, occupied)
+        self._move_toward(game, occupied, dist_map)
 
     def _fireball_center(self, game):
         """Pick a center tile adjacent to the player for fireball."""
@@ -852,19 +973,19 @@ class Wizard(Entity):
             return None
         return random.choice(candidates)
 
-    def _try_flee(self, game, occupied):
+    def _try_flee(self, game, occupied, dist_map=None):
         """Move one step away from the player if too close."""
         px, py = game.player.gx, game.player.gy
         dist_sq = (self.gx - px) ** 2 + (self.gy - py) ** 2
         if dist_sq > self.FLEE_RANGE_SQ:
             return
         best = None
-        best_d = dist_sq
+        best_d = dist_map.get((self.gx, self.gy), 0) if dist_map else dist_sq
         for dx, dy in DIRS:
             nx, ny = self.gx + dx, self.gy + dy
-            if 0 <= nx < COLS and 0 <= ny < ROWS and (nx, ny) not in occupied \
+            if is_passable(nx, ny) and (nx, ny) not in occupied \
                     and (nx, ny) != (px, py):
-                d = (nx - px) ** 2 + (ny - py) ** 2
+                d = dist_map.get((nx, ny), 9999) if dist_map else (nx - px) ** 2 + (ny - py) ** 2
                 if d > best_d:
                     best_d = d
                     best = (nx, ny)
@@ -872,15 +993,15 @@ class Wizard(Entity):
             self.update_facing(best[0] - self.gx)
             self.gx, self.gy = best
 
-    def _move_toward(self, game, occupied):
+    def _move_toward(self, game, occupied, dist_map=None):
         px, py = game.player.gx, game.player.gy
         best = None
-        best_d = (self.gx - px) ** 2 + (self.gy - py) ** 2
+        best_d = dist_map.get((self.gx, self.gy), 9999) if dist_map else (self.gx - px) ** 2 + (self.gy - py) ** 2
         for dx, dy in DIRS:
             nx, ny = self.gx + dx, self.gy + dy
-            if 0 <= nx < COLS and 0 <= ny < ROWS and (nx, ny) not in occupied \
+            if is_passable(nx, ny) and (nx, ny) not in occupied \
                     and (nx, ny) != (px, py):
-                d = (nx - px) ** 2 + (ny - py) ** 2
+                d = dist_map.get((nx, ny), 9999) if dist_map else (nx - px) ** 2 + (ny - py) ** 2
                 if d < best_d:
                     best_d = d
                     best = (nx, ny)
@@ -929,7 +1050,7 @@ class Summoner(Entity):
     def overlay_color(self):
         return (180, 140, 60, 40)
 
-    def take_turn(self, game, occupied):
+    def take_turn(self, game, occupied, dist_map=None):
         px, py = game.player.gx, game.player.gy
         dist_sq = (self.gx - px) ** 2 + (self.gy - py) ** 2
         too_close = dist_sq <= self.FLEE_RANGE_SQ
@@ -937,14 +1058,14 @@ class Summoner(Entity):
         if self.cooldown == 0:
             # If too close, flee instead of summoning
             if too_close:
-                self._try_flee(game, occupied, px, py)
+                self._try_flee(game, occupied, px, py, dist_map)
                 self.cooldown = 1
                 return
             # Summon a slime on an adjacent empty tile — defer until cast frame
             candidates = []
             for dx, dy in DIRS:
                 nx, ny = self.gx + dx, self.gy + dy
-                if 0 <= nx < COLS and 0 <= ny < ROWS \
+                if is_passable(nx, ny) \
                         and (nx, ny) not in occupied \
                         and (nx, ny) != (px, py):
                     candidates.append((nx, ny))
@@ -963,22 +1084,22 @@ class Summoner(Entity):
                 return
 
         self.cooldown = max(0, self.cooldown - 1)
-        self._try_flee(game, occupied, px, py)
+        self._try_flee(game, occupied, px, py, dist_map)
 
     FLEE_RANGE_SQ = 15
 
-    def _try_flee(self, game, occupied, px, py):
+    def _try_flee(self, game, occupied, px, py, dist_map=None):
         dist_sq = (self.gx - px) ** 2 + (self.gy - py) ** 2
         if dist_sq > self.FLEE_RANGE_SQ:
             return
         best = None
-        best_d = dist_sq
+        best_d = dist_map.get((self.gx, self.gy), 0) if dist_map else dist_sq
         for dx, dy in DIRS:
             nx, ny = self.gx + dx, self.gy + dy
-            if 0 <= nx < COLS and 0 <= ny < ROWS \
+            if is_passable(nx, ny) \
                     and (nx, ny) not in occupied \
                     and (nx, ny) != (px, py):
-                d = (nx - px) ** 2 + (ny - py) ** 2
+                d = dist_map.get((nx, ny), 9999) if dist_map else (nx - px) ** 2 + (ny - py) ** 2
                 if d > best_d:
                     best_d = d
                     best = (nx, ny)
@@ -1039,7 +1160,7 @@ class StoneGolem(Entity):
         dy = abs(self.gy - player.gy)
         return (dx + dy) == 1
 
-    def take_turn(self, game, occupied):
+    def take_turn(self, game, occupied, dist_map=None):
         px, py = game.player.gx, game.player.gy
 
         if self.cooldown > 0:
@@ -1062,14 +1183,14 @@ class StoneGolem(Entity):
 
         # Move one step toward the player, preferring cardinal adjacency
         best = None
-        best_d = (self.gx - px) ** 2 + (self.gy - py) ** 2
+        best_d = dist_map.get((self.gx, self.gy), 9999) if dist_map else (self.gx - px) ** 2 + (self.gy - py) ** 2
         best_cardinal = False  # prefer tiles cardinally adjacent to player
         for dx, dy in DIRS:
             nx, ny = self.gx + dx, self.gy + dy
-            if 0 <= nx < COLS and 0 <= ny < ROWS \
+            if is_passable(nx, ny) \
                     and (nx, ny) not in occupied \
                     and (nx, ny) != (px, py):
-                d = (nx - px) ** 2 + (ny - py) ** 2
+                d = dist_map.get((nx, ny), 9999) if dist_map else (nx - px) ** 2 + (ny - py) ** 2
                 is_cardinal = (abs(nx - px) + abs(ny - py)) == 1
                 # Prefer cardinal adjacency to player, then shortest distance
                 if (is_cardinal and not best_cardinal) \
@@ -1253,7 +1374,7 @@ class Dragon(Entity):
         else:
             self._fireball(game)
 
-    def take_turn(self, game, occupied):
+    def take_turn(self, game, occupied, dist_map=None):
         px, py = game.player.gx, game.player.gy
 
         # --- Claw swipe: always available, any turn type ---
@@ -1500,7 +1621,7 @@ def _sim_attack(px, py, di, enemies):
                        for dx in range(-1, 2) for dy in range(-1, 2)):
                     dragon_block = True
                     break
-        blocked = (not (0 <= nx < COLS and 0 <= ny < ROWS)
+        blocked = (not is_passable(nx, ny)
                    or blocker_i is not None
                    or dragon_block
                    or (nx, ny) == (px, py))
@@ -1698,7 +1819,7 @@ def _collect_leaves(px, py, mode, facing, switched, enemies, fires, depth,
     # Move candidates (8 directions)
     for ddx, ddy in DIRS:
         nx, ny = px + ddx, py + ddy
-        if not (0 <= nx < COLS and 0 <= ny < ROWS):
+        if not is_passable(nx, ny):
             continue
         if (nx, ny) in occupied:
             continue
@@ -1769,18 +1890,19 @@ class Button:
 
 LEVELS = [
     # Level 1: intro — slimes only
-    lambda: [Slime(5, 3), Slime(4, 5), Slime(3, 6)],
+    lambda: [Slime(7, 3), Slime(6, 5), Slime(11, 9), Slime(13, 8)],
     # Level 2: slimes + wizards
-    lambda: [Slime(6, 6), Slime(3, 3),
-             Wizard(6, 1), Wizard(5, 5)],
+    lambda: [Slime(6, 9), Slime(10, 3), Slime(9, 8),
+             Wizard(13, 5), Wizard(5, 4)],
     # Level 3: stone golems join
-    lambda: [Slime(4, 4), SwordSlime(5, 6),
-             Wizard(6, 3),
-             StoneGolem(3, 3)],
+    lambda: [Slime(4, 4), SwordSlime(10, 6),
+             Wizard(10, 4),
+             StoneGolem(3, 3), StoneGolem(7, 5)],
     # Level 4: summoner appears
     lambda: [SwordSlime(5, 3),
-             Wizard(7, 4),
-             Summoner(4, 2),
+             Wizard(6, 7),
+             Summoner(9, 2),
+             Summoner(10, 7),
              StoneGolem(3, 4)],
     # Level 5: boss fight
     lambda: [
@@ -1837,6 +1959,7 @@ class Game:
     ]
 
     def __init__(self):
+        pygame.mixer.pre_init(44100, -16, 2, 512)
         pygame.init()
         preload_sfx()
         self.width = COLS * TILE
@@ -1857,7 +1980,8 @@ class Game:
         self.level = 0
         self._current_bgm = None
         self._start_bgm()
-        self.player = Player(0, ROWS // 2)
+        sx, sy = PLAYER_SPAWN.get(self.level, (1, ROWS // 2))
+        self.player = Player(sx, sy)
         self.enemies = LEVELS[self.level]()
         self.phase = "player"
         self.history = []
@@ -1885,6 +2009,7 @@ class Game:
         self._god_fade_out = 0.0  # >0 while fading out
         self._god_message = ""
         self._god_sprite = None
+        self._god_sprite_cache = {}  # filename -> Surface
 
         self._btn_w, self._btn_h = 200, 56
         self.undo_btn = Button(
@@ -1899,6 +2024,8 @@ class Game:
         self.followed_instruction = False
         self._last_instruction = self.instruction
         self._inst_glow_timer = 0.0
+        self._golden_flash = 0.0
+        self._fw_popup = None  # (text, timer) e.g. ("-10", 1.0)
         # Preload tablet background (raw + scaled for current level)
         _tab_path = os.path.join(ASSET_DIR, "Tablet.png")
         self._tablet_img_raw = pygame.image.load(_tab_path).convert_alpha()
@@ -1911,11 +2038,11 @@ class Game:
             1: [_load("floor1-l2.png")],
             2: [_load("floor2-l1.png")],
             3: [_load("floor2-l2.png")],
-            4: [_load("Floor3.png")],
+            4: [_load("floor3.png")],
         }
         grid_w, grid_h = COLS * TILE, ROWS * TILE
         self._floor_layers_scaled = [
-            pygame.transform.smoothscale(layer, (grid_w, grid_h))
+            pygame.transform.scale(layer, (grid_w, grid_h))
             for layer in self._floor_layers_raw.get(self.level, [])
         ]
 
@@ -2013,6 +2140,8 @@ class Game:
         if not self.followed_instruction and action_label == self.instruction:
             self.followed_instruction = True
             self.player.free_will = max(0, self.player.free_will - 10)
+            self._golden_flash = 0.4
+            self._fw_popup = ("-10", 1.0)
 
     def handle_click(self, pos):
         mx, my = pos
@@ -2024,6 +2153,7 @@ class Game:
             # Increase free will if instruction was never followed this turn
             if not self.followed_instruction:
                 p.free_will = min(100, p.free_will + 10)
+                self._fw_popup = ("+10", 1.0)
             self.phase = "animating"
             # Reset shields at start of enemy phase
             for e in self.enemies:
@@ -2036,11 +2166,12 @@ class Game:
                     else:
                         occupied.add((e.gx, e.gy))
             # Non-dragon enemies act now; dragons deferred
+            dist_map = bfs_distance(p.gx, p.gy, self.level)
             for e in list(self.enemies):
                 if e.alive() and not isinstance(e, Dragon):
                     occupied.discard((e.gx, e.gy))
                     e.update_facing(p.gx - e.gx)
-                    e.take_turn(self, occupied)
+                    e.take_turn(self, occupied, dist_map)
                     e.update_facing(p.gx - e.gx)
                     occupied.add((e.gx, e.gy))
             # Queue dragon turns for after animations finish
@@ -2210,7 +2341,7 @@ class Game:
                                     and (nx, ny) in e.body_tiles():
                                 dragon_blocker = e
                                 break
-                        blocked = (not (0 <= nx < COLS and 0 <= ny < ROWS)
+                        blocked = (not is_passable(nx, ny)
                                    or blocker is not None
                                    or dragon_blocker is not None
                                    or (nx, ny) == (p.gx, p.gy))
@@ -2281,16 +2412,28 @@ class Game:
                 self.shake_timer = 0
         # BGM volume fade
         if self._bgm_fade_target is not None:
-            vol = pygame.mixer.music.get_volume()
-            diff = self._bgm_fade_target - vol
-            if abs(diff) < 0.01:
-                pygame.mixer.music.set_volume(self._bgm_fade_target)
+            try:
+                vol = pygame.mixer.music.get_volume()
+                diff = self._bgm_fade_target - vol
+                if abs(diff) < 0.01:
+                    pygame.mixer.music.set_volume(self._bgm_fade_target)
+                    self._bgm_fade_target = None
+                else:
+                    pygame.mixer.music.set_volume(vol + diff * min(2.0 * dt, 1.0))
+            except Exception:
                 self._bgm_fade_target = None
-            else:
-                pygame.mixer.music.set_volume(vol + diff * min(2.0 * dt, 1.0))
         # Instruction glow timer
         if self._inst_glow_timer > 0:
             self._inst_glow_timer = max(0, self._inst_glow_timer - dt)
+        if self._golden_flash > 0:
+            self._golden_flash = max(0, self._golden_flash - dt)
+        if self._fw_popup is not None:
+            text, timer = self._fw_popup
+            timer -= dt
+            if timer <= 0:
+                self._fw_popup = None
+            else:
+                self._fw_popup = (text, timer)
         if self.instruction != self._last_instruction:
             self._last_instruction = self.instruction
             self._inst_glow_timer = 1.5
@@ -2341,7 +2484,10 @@ class Game:
             beam.update(dt, self)
         for beam in self.breath_beams:
             if beam.done and getattr(beam, 'sfx_channel', None) is not None:
-                beam.sfx_channel.fadeout(800)
+                try:
+                    beam.sfx_channel.fadeout(800)
+                except Exception:
+                    pass
                 beam.sfx_channel = None
         self.breath_beams = [b for b in self.breath_beams if not b.done]
         # Fire tile rising particles
@@ -2391,7 +2537,7 @@ class Game:
                 for e in self.enemies:
                     if e.alive() and isinstance(e, Dragon):
                         occupied -= e.body_tiles()
-                        e.take_turn(self, occupied)
+                        e.take_turn(self, occupied, None)
                         occupied.update(e.body_tiles())
                 return
             if all_done:
@@ -2470,7 +2616,10 @@ class Game:
                 self.fade_direction = -1
                 # Level 5: start music at full volume immediately
                 if self.level == 4:
-                    pygame.mixer.music.set_volume(1.0)
+                    try:
+                        pygame.mixer.music.set_volume(1.0)
+                    except Exception:
+                        pass
                     self._fade_hold = 0.0
             elif self.fade_direction == -1 and self.fade_alpha <= 0:
                 # Fade-in complete
@@ -2501,16 +2650,20 @@ class Game:
             return
         self._current_bgm = track
         path = os.path.join(ASSET_DIR, track)
-        pygame.mixer.music.load(path)
-        pygame.mixer.music.set_volume(0.4)
-        pygame.mixer.music.play(-1)
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.set_volume(0.4)
+            pygame.mixer.music.play(-1)
+        except Exception:
+            pass
 
     def _go_to_level(self, level):
         """Jump to a specific level index. Used by level transitions and cheats."""
-        global COLS, ROWS
+        global COLS, ROWS, _current_level
         if level < 0 or level >= len(LEVELS):
             return
         self.level = level
+        _current_level = level
         # Update grid dimensions for this level
         COLS, ROWS = LEVEL_DIMS.get(level, LEVEL_DIMS[0])
         self.width = COLS * TILE
@@ -2523,7 +2676,7 @@ class Game:
         # Rescale floor layers for new grid size
         grid_w, grid_h = COLS * TILE, ROWS * TILE
         self._floor_layers_scaled = [
-            pygame.transform.smoothscale(layer, (grid_w, grid_h))
+            pygame.transform.scale(layer, (grid_w, grid_h))
             for layer in self._floor_layers_raw.get(level, [])
         ]
         # Reposition buttons for new width
@@ -2532,9 +2685,10 @@ class Game:
         self._start_bgm()
         p = self.player
         # Reset player position and state
-        p.gx, p.gy = 0, ROWS // 2
-        p.pos = [0, (ROWS // 2) * TILE]
-        p.committed = [0, ROWS // 2]
+        sx, sy = PLAYER_SPAWN.get(level, (1, ROWS // 2))
+        p.gx, p.gy = sx, sy
+        p.pos = [sx * TILE, sy * TILE]
+        p.committed = [sx, sy]
         p.mode = "sword"
         p.facing_right = True
         p.switched_this_turn = False
@@ -2574,7 +2728,10 @@ class Game:
         print("[DEBUG] _start_dragon_intro called")
         self.phase = "dragon_intro"
         self._intro_active = True
-        pygame.mixer.music.set_volume(1.0)
+        try:
+            pygame.mixer.music.set_volume(1.0)
+        except Exception:
+            pass
         self._bgm_fade_target = None
         # Hide player offscreen during intro
         self.player.gx = -5
@@ -2742,7 +2899,10 @@ class Game:
 
         # Fade out beam sound as beam ends
         if t >= breath_end and getattr(self, '_intro_beam_channel', None) is not None:
-            self._intro_beam_channel.fadeout(800)
+            try:
+                self._intro_beam_channel.fadeout(800)
+            except Exception:
+                pass
             self._intro_beam_channel = None
 
         # Beat 42: done (allow sweep to finish + linger)
@@ -2755,9 +2915,10 @@ class Game:
             dragon.anim = dragon.idle_anim
             self._bgm_fade_target = 0.4
             p = self.player
-            p.gx, p.gy = 0, ROWS // 2
-            p.pos = [-3 * TILE, (ROWS // 2) * TILE]
-            p.committed = [0, ROWS // 2]
+            sx, sy = PLAYER_SPAWN.get(self.level, (1, ROWS // 2))
+            p.gx, p.gy = sx, sy
+            p.pos = [(sx - 3) * TILE, sy * TILE]
+            p.committed = [sx, sy]
             # Keep 30% of fire tiles, but clear the player's spawn and adjacent tiles
             safe = set()
             for ddx in range(-1, 2):
@@ -2854,7 +3015,6 @@ class Game:
         # ── Level floor background ───────────────────────────
         for layer in self._floor_layers_scaled:
             self.screen.blit(layer, (0, UI_H))
-
         # ── Tablet UI at the top ──────────────────────────────
         self.screen.blit(self._tablet_img, (0, 0))
         p = self.player
@@ -2874,6 +3034,14 @@ class Game:
         if fill_w > 0:
             pygame.draw.rect(self.screen, (220, 180, 60), (fw_x, fw_bar_y, fill_w, fw_h))
         pygame.draw.rect(self.screen, (90, 80, 60), (fw_x, fw_bar_y, fw_w, fw_h), 2)
+        # Free will change popup
+        if self._fw_popup is not None:
+            fw_text, fw_timer = self._fw_popup
+            frac = fw_timer / 1.0
+            popup_surf = self.small_font.render(fw_text, True, (220, 180, 60))
+            popup_surf.set_alpha(int(255 * frac))
+            popup_y = fw_bar_y - int(30 * (1 - frac))
+            self.screen.blit(popup_surf, (fw_x + fw_w + 8, popup_y))
 
         # Right side: undo (top) + confirm (bottom)
         btn_active = self.phase == "player" and len(self.history) > 0
@@ -2922,7 +3090,15 @@ class Game:
         hovered = self.hovered_enemy()
         enemy_range = hovered.range_tiles() if hovered else set()
         p = self.player
-        player_range = p.attack_range_tiles() if self.phase == "player" else set()
+        # Hovered tile highlight (adjacent to player)
+        hover_tile = None
+        if self.phase == "player":
+            hmx, hmy = self._screen_to_native(pygame.mouse.get_pos())
+            hgx = hmx // TILE
+            hgy = (hmy - UI_H) // TILE
+            dist = max(abs(hgx - p.gx), abs(hgy - p.gy))
+            if dist == 0 or (dist == 1 and is_passable(hgx, hgy)):
+                hover_tile = (hgx, hgy)
         # During facing pick, preview shield cone toward mouse
         preview_facing = None
         if self.picking_facing:
@@ -2944,8 +3120,8 @@ class Game:
         enemy_overlay = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
         if hovered:
             enemy_overlay.fill(hovered.overlay_color())
-        attack_overlay = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
-        attack_overlay.fill((80, 200, 120, 30))
+        hover_overlay = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
+        hover_overlay.fill((255, 255, 255, 40))
         shield_overlay = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
         shield_overlay.fill((100, 160, 220, 35))
 
@@ -2954,11 +3130,10 @@ class Game:
                 rect = pygame.Rect(x * TILE, UI_H + y * TILE, TILE, TILE)
                 if (x, y) in enemy_range:
                     self.screen.blit(enemy_overlay, rect)
-                if (x, y) in player_range:
-                    self.screen.blit(attack_overlay, rect)
+                if hover_tile and (x, y) == hover_tile:
+                    self.screen.blit(hover_overlay, rect)
                 if (x, y) in shield_tiles:
                     self.screen.blit(shield_overlay, rect)
-                pygame.draw.rect(self.screen, (60, 60, 60), rect, 1)
 
         # Facing indicator (shield mode only)
         if p.mode == "shield":
@@ -3013,13 +3188,15 @@ class Game:
             overlay.fill((0, 0, 0, god_alpha // 2))
             self.screen.blit(overlay, (0, 0))
             # God sprite — dark silhouette filling vertical screen space
-            raw = pygame.image.load(
-                os.path.join(ASSET_DIR, self._god_sprite)).convert_alpha()
+            if self._god_sprite not in self._god_sprite_cache:
+                self._god_sprite_cache[self._god_sprite] = pygame.image.load(
+                    os.path.join(ASSET_DIR, self._god_sprite)).convert_alpha()
+            raw = self._god_sprite_cache[self._god_sprite]
             # Scale to fill the full screen height
             img_scale = self.native_h / raw.get_height()
             sw = int(raw.get_width() * img_scale)
             sh = self.native_h
-            god_img = pygame.transform.smoothscale(raw, (sw, sh))
+            god_img = pygame.transform.scale(raw, (sw, sh))
             # Turn into a dark silhouette: fill with black, keep alpha shape
             silhouette = pygame.Surface((sw, sh), pygame.SRCALPHA)
             silhouette.blit(god_img, (0, 0))
@@ -3031,8 +3208,15 @@ class Game:
             msg_surf = self.font.render(self._god_message, True, (220, 210, 180))
             msg_surf.set_alpha(god_alpha)
             mx = (self.native_w - msg_surf.get_width()) // 2
-            my = self.native_h // 2 + 20
+            my = self.native_h - msg_surf.get_height() - 40
             self.screen.blit(msg_surf, (mx, my))
+
+        # Golden flash when free will decreases
+        if self._golden_flash > 0:
+            frac = self._golden_flash / 0.4
+            flash = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+            flash.fill((255, 200, 60, int(30 * frac)))
+            self.screen.blit(flash, (0, 0))
 
         # Level transition fade
         if self.phase == "fading":
@@ -3096,7 +3280,13 @@ class Game:
         except KeyboardInterrupt:
             pass
         finally:
-            sys.exit()
+            # try:
+            #     pygame.mixer.music.stop()
+            #     pygame.mixer.quit()
+            #     pygame.quit()
+            # except Exception:
+            #     pass
+            os._exit(0)
 
 
 if __name__ == "__main__":
