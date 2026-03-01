@@ -1993,9 +1993,9 @@ class Game:
         self.native_w = self.width
         self.native_h = self.height + self.UI_HEIGHT
         self.display = pygame.display.set_mode(
-            (self.native_w, self.native_h), pygame.RESIZABLE)
+            (self.native_w // 2, self.native_h // 4), pygame.RESIZABLE)
         self.screen = pygame.Surface((self.native_w, self.native_h))
-        pygame.display.set_caption("Grid Game")
+        pygame.display.set_caption("The Prophecy of Kaironth")
         self.clock = pygame.time.Clock()
         _font_path = os.path.join(os.path.dirname(__file__), "assets", "alagard.ttf")
         self.font = pygame.font.Font(_font_path, 72)
