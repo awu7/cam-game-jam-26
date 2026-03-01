@@ -147,6 +147,29 @@ def preload_sfx():
             _sound_cache[fn] = pygame.mixer.Sound(path)
 
 
+def _reinit_mixer():
+    """Quit and re-init the mixer, then reload all cached sounds."""
+    global _sound_cache
+    try:
+        pygame.mixer.quit()
+    except Exception:
+        pass
+    try:
+        pygame.mixer.init(44100, -16, 2, 512)
+    except Exception:
+        return False
+    # Reload all previously cached sounds
+    new_cache = {}
+    for name in list(_sound_cache.keys()):
+        try:
+            path = os.path.join(ASSET_DIR, name)
+            new_cache[name] = pygame.mixer.Sound(path)
+        except Exception:
+            pass
+    _sound_cache = new_cache
+    return True
+
+
 def play_sfx(name, volume=0.5):
     """Play a sound effect by filename (cached). Returns the Channel."""
     try:
@@ -232,6 +255,10 @@ class Entity:
     def take_damage(self, amount):
         actual = max(0, amount - self.shield)
         self.hp -= actual
+        if actual > 0:
+            if not hasattr(self, '_pending_popups'):
+                self._pending_popups = []
+            self._pending_popups.append(actual)
         return actual
 
     def ease(self, dt):
@@ -817,23 +844,22 @@ class HealthPotion:
         self.gy = gy
 
     def draw(self, screen, y_off=0):
-        cx = self.gx * TILE + TILE // 2
-        cy = self.gy * TILE + TILE // 2 + y_off
-        # Green circle with white cross
-        pygame.draw.circle(screen, (40, 180, 60), (cx, cy), 18)
-        pygame.draw.rect(screen, (240, 240, 240), (cx - 10, cy - 3, 20, 6))
-        pygame.draw.rect(screen, (240, 240, 240), (cx - 3, cy - 10, 6, 20))
+        img = load_sprite("Healthpotion.png")
+        screen.blit(img, (self.gx * TILE, self.gy * TILE + y_off))
 
 
 class FireTile:
     DAMAGE = 10
 
-    def __init__(self, gx, gy, turns):
+    def __init__(self, gx, gy, turns, visible=True):
         self.gx = gx
         self.gy = gy
         self.turns = turns  # turns remaining
+        self.visible = visible  # draw burnt sprite
 
     def draw(self, screen, y_off=0):
+        if not self.visible:
+            return
         s = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
         alpha = min(120, 40 + 30 * self.turns)
         s.fill((255, 100, 20, alpha))
@@ -1906,12 +1932,12 @@ LEVELS = [
              StoneGolem(3, 4)],
     # Level 5: boss fight
     lambda: [
-             Dragon(8, 4)],
+             Dragon(LEVEL_DIMS[4][0] - 3, LEVEL_DIMS[4][1] // 2)],
 ]
 
 
 class Game:
-    UI_HEIGHT = 320
+    UI_HEIGHT = 480
     MAX_MOVES = 3
 
     _GOD_POSITIVE = [
@@ -1972,13 +1998,14 @@ class Game:
         pygame.display.set_caption("Grid Game")
         self.clock = pygame.time.Clock()
         _font_path = os.path.join(os.path.dirname(__file__), "assets", "alagard.ttf")
-        self.font = pygame.font.Font(_font_path, 48)
-        self.small_font = pygame.font.Font(_font_path, 36)
-        self.cmd_label_font = pygame.font.Font(_font_path, 40)
-        self.cmd_font = pygame.font.Font(_font_path, 52)
+        self.font = pygame.font.Font(_font_path, 72)
+        self.small_font = pygame.font.Font(_font_path, 54)
+        self.cmd_label_font = pygame.font.Font(_font_path, 60)
+        self.cmd_font = pygame.font.Font(_font_path, 78)
 
         self.level = 0
         self._current_bgm = None
+        self._audio_check_timer = 0.0
         self._start_bgm()
         sx, sy = PLAYER_SPAWN.get(self.level, (1, ROWS // 2))
         self.player = Player(sx, sy)
@@ -2011,13 +2038,13 @@ class Game:
         self._god_sprite = None
         self._god_sprite_cache = {}  # filename -> Surface
 
-        self._btn_w, self._btn_h = 200, 56
+        self._btn_w, self._btn_h = 300, 84
         self.undo_btn = Button(
-            pygame.Rect(self.native_w - self._btn_w - 24, 40, self._btn_w, self._btn_h),
+            pygame.Rect(self.native_w - self._btn_w - 36, 60, self._btn_w, self._btn_h),
             "Undo", (160, 120, 60), self.font,
         )
         self.confirm_btn = Button(
-            pygame.Rect(self.native_w - self._btn_w - 24, 108, self._btn_w, self._btn_h),
+            pygame.Rect(self.native_w - self._btn_w - 36, 162, self._btn_w, self._btn_h),
             "Confirm", (60, 160, 60), self.font,
         )
         self.instruction = self.best_instruction()
@@ -2026,6 +2053,7 @@ class Game:
         self._inst_glow_timer = 0.0
         self._golden_flash = 0.0
         self._fw_popup = None  # (text, timer) e.g. ("-10", 1.0)
+        self._dmg_popups = []  # [(text, timer, px, py), ...]
         # Preload tablet background (raw + scaled for current level)
         _tab_path = os.path.join(ASSET_DIR, "Tablet.png")
         self._tablet_img_raw = pygame.image.load(_tab_path).convert_alpha()
@@ -2118,8 +2146,31 @@ class Game:
                 self.player.hp = min(self.player.max_hp,
                                      self.player.hp + HealthPotion.HEAL)
                 self.potions.remove(pot)
+            # Red-purple particle burst
+            cx = gx * TILE + TILE // 2
+            cy = gy * TILE + TILE // 2
+            for _ in range(24):
+                angle = random.uniform(0, 2 * math.pi)
+                speed = random.uniform(40, 160)
+                vx = math.cos(angle) * speed
+                vy = math.sin(angle) * speed - 30
+                r = random.randint(180, 255)
+                g = random.randint(20, 60)
+                b = random.randint(80, 180)
+                life = random.uniform(0.5, 1.2)
+                rot = random.uniform(-300, 300)
+                self.particles.append([cx, cy, vx, vy, life, (r, g, b),
+                                       random.uniform(0, 360), rot, life, 1.2])
             self._check_instruction("Pick up Health Potion")
             play_sfx("potion.wav", 0.4)
+
+    def _spawn_dmg_popup(self, amount, gx, gy):
+        """Spawn a rising '-X' popup at grid position."""
+        if amount <= 0:
+            return
+        px = gx * TILE + TILE // 2
+        py = gy * TILE + TILE // 2
+        self._dmg_popups.append((f"-{amount}", 0.8, px, py))
 
     def _golem_blocks_attack(self):
         """True if any alive StoneGolem is cardinally adjacent to the player."""
@@ -2154,6 +2205,17 @@ class Game:
             if not self.followed_instruction:
                 p.free_will = min(100, p.free_will + 10)
                 self._fw_popup = ("+10", 1.0)
+            # Free will depleted — puppet death
+            if p.free_will <= 0:
+                self.phase = "dying"
+                self.fade_alpha = 0
+                self.fade_direction = 1
+                self._death_type = "puppet"
+                try:
+                    pygame.mixer.music.fadeout(1500)
+                except Exception:
+                    pass
+                return
             self.phase = "animating"
             # Reset shields at start of enemy phase
             for e in self.enemies:
@@ -2406,6 +2468,24 @@ class Game:
                         self.history.append(before)
 
     def update(self, dt):
+        # Periodically check if audio device died and revive it
+        self._audio_check_timer -= dt
+        if self._audio_check_timer <= 0:
+            self._audio_check_timer = 3.0
+            try:
+                # BGM should always be playing; if it isn't, audio likely died
+                if self._current_bgm and self.phase not in ("dying", "dead") and not pygame.mixer.music.get_busy():
+                    if _reinit_mixer():
+                        self._current_bgm = None
+                        self._start_bgm()
+            except Exception:
+                # get_busy itself threw — mixer is definitely dead
+                try:
+                    if _reinit_mixer():
+                        self._current_bgm = None
+                        self._start_bgm()
+                except Exception:
+                    pass
         if self.shake_timer > 0:
             self.shake_timer -= dt
             if self.shake_timer <= 0:
@@ -2434,6 +2514,8 @@ class Game:
                 self._fw_popup = None
             else:
                 self._fw_popup = (text, timer)
+        self._dmg_popups = [(t, tmr - dt, px, py)
+                            for t, tmr, px, py in self._dmg_popups if tmr - dt > 0]
         if self.instruction != self._last_instruction:
             self._last_instruction = self.instruction
             self._inst_glow_timer = 1.5
@@ -2490,6 +2572,13 @@ class Game:
                     pass
                 beam.sfx_channel = None
         self.breath_beams = [b for b in self.breath_beams if not b.done]
+        # Collect damage popups from all entities
+        for ent in [self.player] + self.enemies:
+            pops = getattr(ent, '_pending_popups', None)
+            if pops:
+                for dmg in pops:
+                    self._spawn_dmg_popup(dmg, ent.gx, ent.gy)
+                ent._pending_popups = []
         # Fire tile rising particles
         for f in self.fire_tiles:
             if random.random() < 0.05:
@@ -2565,8 +2654,26 @@ class Game:
                         e._dropped_potion = True
                         self.potions.append(HealthPotion(e.gx, e.gy))
                 self.enemies = [e for e in self.enemies if e.alive()
-                                or not e.eased()]
+                                or not e.eased()
+                                or isinstance(e, Dragon)]
                 self.history.clear()
+                # Check if player died
+                if not self.player.alive():
+                    self.phase = "dying"
+                    self.fade_alpha = 0
+                    self.fade_direction = 1
+                    self._death_type = "hp"
+                    try:
+                        pygame.mixer.music.fadeout(1500)
+                    except Exception:
+                        pass
+                    return
+                # Check if dragon just died — moral choice cutscene
+                for e in self.enemies:
+                    if isinstance(e, Dragon) and not e.alive() \
+                            and not getattr(self, '_dragon_choice_started', False):
+                        self._start_dragon_choice(e)
+                        return
                 # Check if all enemies are dead — fade to next level
                 if not any(e.alive() for e in self.enemies):
                     if self.level + 1 >= len(LEVELS):
@@ -2597,6 +2704,22 @@ class Game:
                         self._god_message = random.choice(self._GOD_NEGATIVE)
                     self._god_active = True
                     self._god_timer = 0.0
+
+        if self.phase == "dragon_choice":
+            self._update_dragon_choice(dt)
+
+        if self.phase == "dying":
+            self.fade_alpha += 200 * dt
+            if self.fade_alpha >= 255:
+                self.fade_alpha = 255
+                self.phase = "dead"
+                self._dead_timer = 0.0
+
+        if self.phase == "dead":
+            self._dead_timer += dt
+
+        if self.phase == "victory_custom":
+            self._vc_timer = getattr(self, '_vc_timer', 0.0) + dt
 
         if self.phase == "fading":
             fade_speed = 300
@@ -2680,8 +2803,8 @@ class Game:
             for layer in self._floor_layers_raw.get(level, [])
         ]
         # Reposition buttons for new width
-        self.undo_btn.rect.x = self.native_w - self._btn_w - 24
-        self.confirm_btn.rect.x = self.native_w - self._btn_w - 24
+        self.undo_btn.rect.x = self.native_w - self._btn_w - 36
+        self.confirm_btn.rect.x = self.native_w - self._btn_w - 36
         self._start_bgm()
         p = self.player
         # Reset player position and state
@@ -2695,12 +2818,22 @@ class Game:
         # Spawn new enemies
         self.enemies = LEVELS[self.level]()
         self.fire_tiles.clear()
+        # Final level: fire on all impassable tiles
+        if level == 4:
+            p_grid = PASSABILITY.get(4)
+            if p_grid:
+                for ry, row in enumerate(p_grid):
+                    for rx, val in enumerate(row):
+                        if val == 0:
+                            self.fire_tiles.append(FireTile(rx, ry, 999, visible=False))
         self.potions.clear()
         self.breath_beams.clear()
         self._pending_dragon_turn = False
+        self._dragon_choice_started = False
         self.projectiles.clear()
         self.particles.clear()
         self.slash_vfx.clear()
+        self._dmg_popups.clear()
         self.history.clear()
         self.picking_facing = False
         self.picking_facing_state = None
@@ -2722,6 +2855,94 @@ class Game:
             self._post_fade_phase = "player"
         self.phase = self._post_fade_phase
 
+    # ── Dragon death choice cutscene ─────────────────────────────────
+    def _start_dragon_choice(self, dragon):
+        """Begin the Kill / Mercy moral choice after the dragon falls."""
+        self.phase = "dragon_choice"
+        self._dragon_choice_started = True
+        self._dc_dragon = dragon
+        self._dc_timer = 0.0
+        self._dc_phase = "god_fadein"  # god_fadein → buttons → kill_anim / mercy_shake / mercy_success → victory_fade
+        self._dc_god_alpha = 0.0
+        self._dc_buttons_visible = False
+        self._dc_dragon_alpha = 255
+        self._dc_slash = None
+        self._dc_victory_text = None
+        # Create choice buttons (centred at bottom)
+        bw, bh = 300, 84
+        gap = 40
+        total = bw * 2 + gap
+        lx = (self.native_w - total) // 2
+        by = self.native_h - bh - 80
+        self._dc_kill_btn = Button(
+            pygame.Rect(lx, by, bw, bh),
+            "Kill", (180, 40, 40), self.font)
+        self._dc_mercy_btn = Button(
+            pygame.Rect(lx + bw + gap, by, bw, bh),
+            "Mercy", (40, 140, 100), self.font)
+
+    def _update_dragon_choice(self, dt):
+        """Advance the dragon choice cutscene."""
+        self._dc_timer += dt
+        t = self._dc_timer
+        phase = self._dc_phase
+
+        if phase == "god_fadein":
+            self._dc_god_alpha = min(180, int(180 * t / 0.5))
+            if t >= 1.0:
+                self._dc_buttons_visible = True
+                self._dc_phase = "buttons"
+
+        elif phase == "mercy_shake":
+            if t >= 2.0:
+                self._dc_phase = "buttons"
+                self._dc_timer = 0.0
+
+        elif phase == "kill_anim":
+            # Fade out god
+            self._dc_god_alpha = max(0, int(180 * (1.0 - t / 0.5)))
+            # Spawn slash at t=0.2
+            if t >= 0.2 and self._dc_slash is None:
+                d = self._dc_dragon
+                self._dc_slash = SlashVFX(d.gx, d.gy, flip_x=True,
+                                          vertical=True, angle=0, scale=3)
+                play_sfx("whoosh.wav", 0.5)
+                self.start_shake(6, 0.3)
+            if self._dc_slash:
+                self._dc_slash.update(dt)
+            # Fade out dragon
+            if t >= 0.5:
+                self._dc_dragon_alpha = max(0, int(255 * (1.0 - (t - 0.5) / 1.0)))
+            if t >= 2.0:
+                self._dc_phase = "victory_fade"
+                self._dc_timer = 0.0
+                self.fade_alpha = 0
+                self._dc_victory_text = [
+                    "THE DRAGON WAS SLAIN.",
+                    "VICTORY?",
+                ]
+
+        elif phase == "mercy_success":
+            # Fade out god
+            self._dc_god_alpha = max(0, int(180 * (1.0 - t / 0.5)))
+            if t >= 1.5:
+                self._dc_phase = "victory_fade"
+                self._dc_timer = 0.0
+                self.fade_alpha = 0
+                self._dc_victory_text = [
+                    "YOU SPARED THE DRAGON.",
+                    "YOU CHOSE PEACE OVER VIOLENCE.",
+                    "YOU FORGED YOUR OWN DESTINY.",
+                    "VICTORY",
+                ]
+
+        elif phase == "victory_fade":
+            self.fade_alpha = min(255, self.fade_alpha + 200 * dt)
+            if self.fade_alpha >= 255:
+                self.phase = "victory_custom"
+                self._vc_timer = 0.0
+                self.enemies.clear()
+
     # ── Dragon intro cutscene ──────────────────────────────────────
     def _start_dragon_intro(self):
         """Begin the dramatic dragon reveal cutscene."""
@@ -2741,13 +2962,14 @@ class Game:
         for e in self.enemies:
             if isinstance(e, Dragon):
                 e.gx = COLS + 2  # start well offscreen
+                e.gy = ROWS // 2  # centred vertically
                 e.pos = [e.gx * TILE, e.gy * TILE]
                 self._intro_dragon = e
                 break
         # Cutscene timed to 140 BPM — absolute clock
         self._intro_beat = 60.0 / 140.0  # seconds per beat
         self._intro_clock = 0.0
-        self._intro_walk_target = 8
+        self._intro_walk_target = COLS - 3
         self._intro_walk_start_x = (COLS + 2) * TILE
         # Track which one-shot events have fired
         self._intro_roar_fired = False
@@ -3022,26 +3244,26 @@ class Game:
         # Left side: moves (aligned with undo) + free will (aligned with confirm)
         moves_left = self.MAX_MOVES - len(self.history)
         moves_text = self.font.render(f"Moves: {moves_left}", True, (60, 50, 40))
-        self.screen.blit(moves_text, (24, 40))
+        self.screen.blit(moves_text, (36, 60))
 
-        fw_x = 24
-        fw_w, fw_h = 200, 20
+        fw_x = 36
+        fw_w, fw_h = 300, 30
         fw_label = self.font.render("Free Will", True, (60, 50, 40))
-        self.screen.blit(fw_label, (fw_x, 108))
-        fw_bar_y = 108 + fw_label.get_height() + 4
+        self.screen.blit(fw_label, (fw_x, 162))
+        fw_bar_y = 162 + fw_label.get_height() + 6
         pygame.draw.rect(self.screen, (60, 50, 40), (fw_x, fw_bar_y, fw_w, fw_h))
         fill_w = int(fw_w * p.free_will / 100)
         if fill_w > 0:
             pygame.draw.rect(self.screen, (220, 180, 60), (fw_x, fw_bar_y, fill_w, fw_h))
-        pygame.draw.rect(self.screen, (90, 80, 60), (fw_x, fw_bar_y, fw_w, fw_h), 2)
+        pygame.draw.rect(self.screen, (90, 80, 60), (fw_x, fw_bar_y, fw_w, fw_h), 3)
         # Free will change popup
         if self._fw_popup is not None:
             fw_text, fw_timer = self._fw_popup
             frac = fw_timer / 1.0
             popup_surf = self.small_font.render(fw_text, True, (220, 180, 60))
             popup_surf.set_alpha(int(255 * frac))
-            popup_y = fw_bar_y - int(30 * (1 - frac))
-            self.screen.blit(popup_surf, (fw_x + fw_w + 8, popup_y))
+            popup_y = fw_bar_y - int(45 * (1 - frac))
+            self.screen.blit(popup_surf, (fw_x + fw_w + 12, popup_y))
 
         # Right side: undo (top) + confirm (bottom)
         btn_active = self.phase == "player" and len(self.history) > 0
@@ -3062,15 +3284,15 @@ class Game:
             inst_surf = self.cmd_font.render(inst_str, True, (cr, cg, cb))
             label_surf = self.cmd_label_font.render("The Divine Word:", True, (cr, cg, cb))
             # Centre between left info and right buttons
-            left_edge = 240
-            right_edge = self.native_w - 240
+            left_edge = 360
+            right_edge = self.native_w - 360
             mid_w = right_edge - left_edge
-            total_h = label_surf.get_height() + 4 + inst_surf.get_height()
+            total_h = label_surf.get_height() + 6 + inst_surf.get_height()
             top_y = (UI_H - total_h) // 2
             lx = left_edge + (mid_w - label_surf.get_width()) // 2
             self.screen.blit(label_surf, (lx, top_y))
             ix = left_edge + (mid_w - inst_surf.get_width()) // 2
-            iy = top_y + label_surf.get_height() + 4
+            iy = top_y + label_surf.get_height() + 6
             self.screen.blit(inst_surf, (ix, iy))
             # Yellow glow copy: fades in and shrinks to fit the command text
             if t > 0:
@@ -3152,7 +3374,8 @@ class Game:
             pot.draw(self.screen, UI_H)
 
         for e in self.enemies:
-            if e.alive() or not e.eased():
+            if e.alive() or not e.eased() \
+                    or (isinstance(e, Dragon) and self.phase == "dragon_choice"):
                 e.pos[0] += e.bump[0]; e.pos[1] += e.bump[1] + UI_H
                 e.draw(self.screen)
                 e.pos[0] -= e.bump[0]; e.pos[1] -= e.bump[1] + UI_H
@@ -3174,6 +3397,15 @@ class Game:
             rotated = pygame.transform.rotate(ps, pt[6])
             rr = rotated.get_rect(center=(int(pt[0]), int(pt[1]) + UI_H))
             self.screen.blit(rotated, rr)
+
+        # Damage popups
+        for text, tmr, px, py in self._dmg_popups:
+            frac = tmr / 0.8
+            surf = self.small_font.render(text, True, (200, 30, 30))
+            surf.set_alpha(int(255 * frac))
+            dy = int(40 * (1 - frac))
+            self.screen.blit(surf, surf.get_rect(
+                center=(int(px), int(py) + UI_H - dy)))
 
         # God apparition overlay
         if self._god_active:
@@ -3208,7 +3440,7 @@ class Game:
             msg_surf = self.font.render(self._god_message, True, (220, 210, 180))
             msg_surf.set_alpha(god_alpha)
             mx = (self.native_w - msg_surf.get_width()) // 2
-            my = self.native_h - msg_surf.get_height() - 40
+            my = self.native_h - msg_surf.get_height() - 60
             self.screen.blit(msg_surf, (mx, my))
 
         # Golden flash when free will decreases
@@ -3218,11 +3450,137 @@ class Game:
             flash.fill((255, 200, 60, int(30 * frac)))
             self.screen.blit(flash, (0, 0))
 
+        # Dragon choice overlay
+        if self.phase in ("dragon_choice", "victory_custom") and hasattr(self, '_dc_phase'):
+            ga = getattr(self, '_dc_god_alpha', 0)
+            # Dark overlay
+            if ga > 0:
+                ov = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+                ov.fill((0, 0, 0, ga // 2))
+                self.screen.blit(ov, (0, 0))
+                # God silhouette
+                sprite_name = "God_commanding.png"
+                if sprite_name not in self._god_sprite_cache:
+                    self._god_sprite_cache[sprite_name] = pygame.image.load(
+                        os.path.join(ASSET_DIR, sprite_name)).convert_alpha()
+                raw = self._god_sprite_cache[sprite_name]
+                img_scale = self.native_h / raw.get_height()
+                sw = int(raw.get_width() * img_scale)
+                sh = self.native_h
+                god_img = pygame.transform.scale(raw, (sw, sh))
+                sil = pygame.Surface((sw, sh), pygame.SRCALPHA)
+                sil.blit(god_img, (0, 0))
+                sil.fill((0, 0, 0, 255), special_flags=pygame.BLEND_RGB_MIN)
+                sil.set_alpha(ga)
+                gx = (self.native_w - sw) // 2
+                self.screen.blit(sil, (gx, 0))
+                # "Kill it." message
+                msg = self.font.render("Kill it.", True, (220, 210, 180))
+                msg.set_alpha(ga)
+                mx = (self.native_w - msg.get_width()) // 2
+                my = self.native_h - msg.get_height() - 60
+                self.screen.blit(msg, (mx, my))
+            # Dragon fade during kill animation
+            dc_phase = getattr(self, '_dc_phase', '')
+            if dc_phase == "kill_anim":
+                da = getattr(self, '_dc_dragon_alpha', 255)
+                if da < 255:
+                    # Redraw dragon with reduced alpha by overlaying dark
+                    d = self._dc_dragon
+                    dx = d.pos[0] - TILE
+                    dy = d.pos[1] - TILE + UI_H
+                    ds = TILE * 3
+                    dark = pygame.Surface((ds, ds), pygame.SRCALPHA)
+                    dark.fill((0, 0, 0, 255 - da))
+                    self.screen.blit(dark, (dx, dy))
+                # Draw slash VFX
+                sl = getattr(self, '_dc_slash', None)
+                if sl and not sl.done:
+                    sl.draw(self.screen, UI_H)
+            # "YOU CANNOT ESCAPE YOUR DESTINY"
+            if dc_phase == "mercy_shake":
+                msg2 = self.cmd_font.render("YOU CANNOT ESCAPE YOUR DESTINY", True, (220, 40, 40))
+                mx2 = (self.native_w - msg2.get_width()) // 2
+                my2 = self.native_h // 2
+                self.screen.blit(msg2, (mx2, my2))
+            # Kill/Mercy buttons
+            if getattr(self, '_dc_buttons_visible', False):
+                self._dc_kill_btn.draw(self.screen, True)
+                self._dc_mercy_btn.draw(self.screen, True)
+            # Victory fade
+            if dc_phase == "victory_fade":
+                fade = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+                fade.fill((0, 0, 0, int(max(0, min(255, self.fade_alpha)))))
+                self.screen.blit(fade, (0, 0))
+
+        # Custom victory screen
+        if self.phase == "victory_custom":
+            self.screen.fill((0, 0, 0))
+            t = self._vc_timer
+            lines = getattr(self, '_dc_victory_text', ["VICTORY"])
+            cx = self.native_w // 2
+            total_h = len(lines) * 80
+            base_y = (self.native_h - total_h) // 2
+            for i, line in enumerate(lines):
+                delay = i * 1.2
+                if t > delay:
+                    frac = min(1.0, (t - delay) / 0.8)
+                    alpha = int(255 * frac)
+                    color = (60, 220, 120) if line == "VICTORY" else (220, 210, 180)
+                    if line == "VICTORY?":
+                        color = (220, 180, 60)
+                    surf = self.cmd_font.render(line, True, color)
+                    surf.set_alpha(alpha)
+                    self.screen.blit(surf, surf.get_rect(
+                        center=(cx, base_y + i * 80)))
+
         # Level transition fade
         if self.phase == "fading":
             fade = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
             fade.fill((0, 0, 0, int(max(0, min(255, self.fade_alpha)))))
             self.screen.blit(fade, (0, 0))
+
+        # Dying fade-out
+        if self.phase == "dying":
+            fade = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+            fade.fill((0, 0, 0, int(max(0, min(255, self.fade_alpha)))))
+            self.screen.blit(fade, (0, 0))
+
+        # Death screen
+        if self.phase == "dead":
+            self.screen.fill((0, 0, 0))
+            t = self._dead_timer
+            if getattr(self, '_death_type', 'hp') == 'puppet':
+                lines = [
+                    "You lose faith in yourself...",
+                    "You become a puppet of fate...",
+                ]
+            else:
+                lines = [
+                    "Your limbs grow weak...",
+                    "Your head hurts...",
+                    "Is this the end?",
+                ]
+            cx = self.native_w // 2
+            total_h = len(lines) * 80 + 120  # lines + gap + "Another chance?"
+            base_y = (self.native_h - total_h) // 2
+            for i, line in enumerate(lines):
+                delay = i * 1.2
+                if t > delay:
+                    frac = min(1.0, (t - delay) / 0.8)
+                    alpha = int(255 * frac)
+                    surf = self.cmd_font.render(line, True, (200, 180, 160))
+                    surf.set_alpha(alpha)
+                    self.screen.blit(surf, surf.get_rect(
+                        center=(cx, base_y + i * 80)))
+            again_delay = len(lines) * 1.2 + 0.8
+            if t > again_delay:
+                frac = min(1.0, (t - again_delay) / 0.8)
+                alpha = int(255 * frac)
+                again_surf = self.cmd_font.render("Another chance?", True, (220, 200, 160))
+                again_surf.set_alpha(alpha)
+                self.screen.blit(again_surf, again_surf.get_rect(
+                    center=(cx, base_y + len(lines) * 80 + 120)))
 
         # Victory overlay
         if self.phase == "victory":
@@ -3259,13 +3617,42 @@ class Game:
                     if event.type == pygame.QUIT:
                         running = False
                         break
-                    if event.type == pygame.MOUSEBUTTONDOWN and self._god_active and self._god_fade_out == 0:
+                    # Dragon choice buttons
+                    if event.type == pygame.MOUSEBUTTONDOWN and self.phase == "dragon_choice" \
+                            and self._dc_phase == "buttons":
+                        mpos = self._screen_to_native(event.pos)
+                        if self._dc_kill_btn.clicked(mpos):
+                            self._dc_phase = "kill_anim"
+                            self._dc_timer = 0.0
+                            self._dc_buttons_visible = False
+                        elif self._dc_mercy_btn.clicked(mpos):
+                            if self.player.free_will < 90:
+                                self._dc_phase = "mercy_shake"
+                                self._dc_timer = 0.0
+                                self.start_shake(10, 1.5)
+                            else:
+                                self._dc_phase = "mercy_success"
+                                self._dc_timer = 0.0
+                                self._dc_buttons_visible = False
+                    _dead_click_t = 4.0 if getattr(self, '_death_type', 'hp') == 'puppet' else 5.2
+                    if event.type == pygame.MOUSEBUTTONDOWN and self.phase == "dead" and self._dead_timer > _dead_click_t:
+                        self._current_bgm = None
+                        self.player.hp = self.player.max_hp
+                        self.player.free_will = 50
+                        self._go_to_level(self.level)
+                    elif event.type == pygame.MOUSEBUTTONDOWN and self._god_active and self._god_fade_out == 0 and self._god_timer >= 0.5:
                         self._god_fade_out = 0.5
                     elif event.type == pygame.MOUSEBUTTONDOWN and self.phase == "player":
                         self.handle_click(self._screen_to_native(event.pos))
                     if event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_n:
-                            if self.level + 1 == 4:
+                            if self.level == 4:
+                                # Set dragon to 1 HP
+                                for e in self.enemies:
+                                    if isinstance(e, Dragon):
+                                        e.hp = 1
+                                        break
+                            elif self.level + 1 == 4:
                                 self.phase = "fading"
                                 self.fade_alpha = 0
                                 self.fade_direction = 1
