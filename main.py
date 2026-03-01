@@ -2002,6 +2002,7 @@ class Game:
         self.small_font = pygame.font.Font(_font_path, 54)
         self.cmd_label_font = pygame.font.Font(_font_path, 60)
         self.cmd_font = pygame.font.Font(_font_path, 78)
+        self.title_font = pygame.font.Font(_font_path, 136)
 
         self.level = 0
         self._current_bgm = None
@@ -2010,7 +2011,8 @@ class Game:
         sx, sy = PLAYER_SPAWN.get(self.level, (1, ROWS // 2))
         self.player = Player(sx, sy)
         self.enemies = LEVELS[self.level]()
-        self.phase = "player"
+        self.phase = "menu"
+        self._menu_timer = 0.0
         self.history = []
         self.projectiles = []
         self.particles = []
@@ -2227,17 +2229,21 @@ class Game:
                         occupied.update(e.body_tiles())
                     else:
                         occupied.add((e.gx, e.gy))
+            # If the dragon just fell, skip all enemy turns (moral choice pending)
+            dragon_fallen = any(isinstance(e, Dragon) and not e.alive()
+                                for e in self.enemies)
             # Non-dragon enemies act now; dragons deferred
-            dist_map = bfs_distance(p.gx, p.gy, self.level)
-            for e in list(self.enemies):
-                if e.alive() and not isinstance(e, Dragon):
-                    occupied.discard((e.gx, e.gy))
-                    e.update_facing(p.gx - e.gx)
-                    e.take_turn(self, occupied, dist_map)
-                    e.update_facing(p.gx - e.gx)
-                    occupied.add((e.gx, e.gy))
+            if not dragon_fallen:
+                dist_map = bfs_distance(p.gx, p.gy, self.level)
+                for e in list(self.enemies):
+                    if e.alive() and not isinstance(e, Dragon):
+                        occupied.discard((e.gx, e.gy))
+                        e.update_facing(p.gx - e.gx)
+                        e.take_turn(self, occupied, dist_map)
+                        e.update_facing(p.gx - e.gx)
+                        occupied.add((e.gx, e.gy))
             # Queue dragon turns for after animations finish
-            self._pending_dragon_turn = True
+            self._pending_dragon_turn = not dragon_fallen
             self.history.clear()
         elif self.undo_btn.clicked(pos):
             if self.picking_facing:
@@ -2418,7 +2424,8 @@ class Game:
                             target.gx, target.gy = nx, ny
                 # Immediately drop potions for all enemies killed this attack
                 for e in self.enemies:
-                    if not e.alive() and not getattr(e, '_dropped_potion', False):
+                    if not e.alive() and not getattr(e, '_dropped_potion', False) \
+                            and not isinstance(e, Dragon):
                         e._dropped_potion = True
                         self.potions.append(HealthPotion(e.gx, e.gy))
                 self.history.append(before)
@@ -2538,7 +2545,8 @@ class Game:
             else:
                 e.ease(dt)
             # Drop potion immediately when an enemy dies (e.g. knockback)
-            if not e.alive() and not getattr(e, '_dropped_potion', False):
+            if not e.alive() and not getattr(e, '_dropped_potion', False) \
+                    and not isinstance(e, Dragon):
                 e._dropped_potion = True
                 self.potions.append(HealthPotion(e.gx, e.gy))
             # Fire pending spells — summoner waits until anim finishes
@@ -2650,7 +2658,8 @@ class Game:
                 self.fire_tiles = [f for f in self.fire_tiles if f.turns > 0]
                 # Drop health potions for newly dead enemies
                 for e in self.enemies:
-                    if not e.alive() and not getattr(e, '_dropped_potion', False):
+                    if not e.alive() and not getattr(e, '_dropped_potion', False) \
+                            and not isinstance(e, Dragon):
                         e._dropped_potion = True
                         self.potions.append(HealthPotion(e.gx, e.gy))
                 self.enemies = [e for e in self.enemies if e.alive()
@@ -2707,6 +2716,9 @@ class Game:
 
         if self.phase == "dragon_choice":
             self._update_dragon_choice(dt)
+
+        if self.phase == "opening":
+            self._update_opening(dt)
 
         if self.phase == "dying":
             self.fade_alpha += 200 * dt
@@ -2855,14 +2867,71 @@ class Game:
             self._post_fade_phase = "player"
         self.phase = self._post_fade_phase
 
+    # ── Opening narration ─────────────────────────────────────────────
+    _OPENING_NARRATION = [
+        {"speaker": None,
+         "text": "In the dawn of the New World, two Gods held the balance: Thrylos, the Order of the Felis Catus, and Argoleia, the Pack of Canis Lupus."},
+        {"speaker": None,
+         "text": "Then came the Prophecy of Kaironth. Where Thrylos saw an omen of ash and ruin... Argoleia saw the fire of a necessary rebirth."},
+        {"speaker": "thrylos",
+         "text": "My loyal warrior, the fragile peace of this world strains under Kaironth's shadow."},
+        {"speaker": "thrylos",
+         "text": "It is your destiny to go forth as the blade of my will."},
+        {"speaker": "thrylos",
+         "text": "Heed my advice, and we shall emerge victorious together."},
+        {"speaker": "thrylos",
+         "text": "Strike down the Dragon Kaironth, and eternity shall remember your obedience."},
+    ]
+
+    def _start_opening(self):
+        self.phase = "opening"
+        self._op_index = 0
+        self._op_alpha = 0.0
+        self._op_god_alpha = 0
+        self._op_timer = 0.0
+
+    def _advance_opening(self):
+        self._op_index += 1
+        self._op_timer = 0.0
+        self._op_alpha = 0.0
+        if self._op_index >= len(self._OPENING_NARRATION):
+            self.phase = "player"
+
+    def _update_opening(self, dt):
+        self._op_timer += dt
+        self._op_alpha = min(255.0, self._op_alpha + 400 * dt)
+        entry = self._OPENING_NARRATION[self._op_index]
+        if entry["speaker"] == "thrylos":
+            target = min(180, int(self._op_alpha * 180 / 255))
+            self._op_god_alpha = max(self._op_god_alpha, target)
+        else:
+            self._op_god_alpha = max(0, self._op_god_alpha - int(400 * dt))
+
     # ── Dragon death choice cutscene ─────────────────────────────────
+    _DC_NARRATION = [
+        {"speaker": "thrylos",
+         "text": 'The blade is in your hand, my loyal warrior. The Order of the Felis Catus demands its tithe of blood. Silence the beast.'},
+        {"speaker": None,
+         "text": "The Dragon Kaironth looks pitiful as it lays broken on the ground. You had expected a monster of ancient malice, but you see only the shivering pulse of a creature too young for its own legend."},
+        {"speaker": None,
+         "text": "You once felt its fire in the heat of battle... but now, you feel its fear. It is not a bringer of ruin. It is just a child of the Prophecy, chained to a fate it never chose."},
+        {"speaker": None,
+         "text": "Just as you are chained to the will of Thrylos."},
+        {"speaker": None,
+         "text": "...Or are you?"},
+        {"speaker": None,
+         "text": "The blade feels heavy in your hands as you weigh your options."},
+    ]
+
     def _start_dragon_choice(self, dragon):
         """Begin the Kill / Mercy moral choice after the dragon falls."""
         self.phase = "dragon_choice"
         self._dragon_choice_started = True
         self._dc_dragon = dragon
         self._dc_timer = 0.0
-        self._dc_phase = "god_fadein"  # god_fadein → buttons → kill_anim / mercy_shake / mercy_success → victory_fade
+        self._dc_phase = "narration"  # narration → god_fadein → buttons → kill_anim / mercy_shake / mercy_success → victory_fade
+        self._dc_narr_index = 0
+        self._dc_narr_alpha = 0.0       # fade-in alpha for current line
         self._dc_god_alpha = 0.0
         self._dc_buttons_visible = False
         self._dc_dragon_alpha = 255
@@ -2881,11 +2950,32 @@ class Game:
             pygame.Rect(lx + bw + gap, by, bw, bh),
             "Mercy", (40, 140, 100), self.font)
 
+    def _advance_narration(self):
+        """Advance to the next narration line, or transition out."""
+        self._dc_narr_index += 1
+        self._dc_timer = 0.0
+        self._dc_narr_alpha = 0.0
+        if self._dc_narr_index >= len(self._DC_NARRATION):
+            # Narration finished — transition to god_fadein → buttons
+            self._dc_phase = "god_fadein"
+            self._dc_timer = 0.0
+
     def _update_dragon_choice(self, dt):
         """Advance the dragon choice cutscene."""
         self._dc_timer += dt
         t = self._dc_timer
         phase = self._dc_phase
+
+        if phase == "narration":
+            # Fade in current narration line
+            self._dc_narr_alpha = min(255.0, self._dc_narr_alpha + 400 * dt)
+            entry = self._DC_NARRATION[self._dc_narr_index]
+            # Show/hide god silhouette based on speaker
+            if entry["speaker"] == "thrylos":
+                self._dc_god_alpha = min(180, int(self._dc_narr_alpha * 180 / 255))
+            else:
+                self._dc_god_alpha = max(0, self._dc_god_alpha - int(400 * dt))
+            return
 
         if phase == "god_fadein":
             self._dc_god_alpha = min(180, int(180 * t / 0.5))
@@ -2914,6 +3004,9 @@ class Game:
             if t >= 0.5:
                 self._dc_dragon_alpha = max(0, int(255 * (1.0 - (t - 0.5) / 1.0)))
             if t >= 2.0:
+                # Dragon is killed — remove it from the enemies list
+                self.enemies = [e for e in self.enemies
+                                if not isinstance(e, Dragon)]
                 self._dc_phase = "victory_fade"
                 self._dc_timer = 0.0
                 self.fade_alpha = 0
@@ -3373,9 +3466,13 @@ class Game:
         for pot in self.potions:
             pot.draw(self.screen, UI_H)
 
+        _dc_fading = (getattr(self, '_dc_phase', '') == "kill_anim"
+                      and getattr(self, '_dc_dragon_alpha', 255) < 255)
         for e in self.enemies:
+            if isinstance(e, Dragon) and _dc_fading:
+                continue  # drawn separately with alpha in the kill_anim block
             if e.alive() or not e.eased() \
-                    or (isinstance(e, Dragon) and self.phase == "dragon_choice"):
+                    or isinstance(e, Dragon):
                 e.pos[0] += e.bump[0]; e.pos[1] += e.bump[1] + UI_H
                 e.draw(self.screen)
                 e.pos[0] -= e.bump[0]; e.pos[1] -= e.bump[1] + UI_H
@@ -3452,9 +3549,71 @@ class Game:
 
         # Dragon choice overlay
         if self.phase in ("dragon_choice", "victory_custom") and hasattr(self, '_dc_phase'):
+            dc_phase = getattr(self, '_dc_phase', '')
             ga = getattr(self, '_dc_god_alpha', 0)
-            # Dark overlay
-            if ga > 0:
+
+            # Narration phase: dark background + word-wrapped text
+            if dc_phase == "narration":
+                narr_alpha = int(getattr(self, '_dc_narr_alpha', 0))
+                # Dark overlay (always present during narration)
+                ov = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+                ov.fill((0, 0, 0, max(narr_alpha // 2, ga // 2)))
+                self.screen.blit(ov, (0, 0))
+                # God silhouette (only for Thrylos lines)
+                if ga > 0:
+                    sprite_name = "God_commanding.png"
+                    if sprite_name not in self._god_sprite_cache:
+                        self._god_sprite_cache[sprite_name] = pygame.image.load(
+                            os.path.join(ASSET_DIR, sprite_name)).convert_alpha()
+                    raw = self._god_sprite_cache[sprite_name]
+                    img_scale = self.native_h / raw.get_height()
+                    sw = int(raw.get_width() * img_scale)
+                    sh = self.native_h
+                    god_img = pygame.transform.scale(raw, (sw, sh))
+                    sil = pygame.Surface((sw, sh), pygame.SRCALPHA)
+                    sil.blit(god_img, (0, 0))
+                    sil.fill((0, 0, 0, 255), special_flags=pygame.BLEND_RGB_MIN)
+                    sil.set_alpha(ga)
+                    gx = (self.native_w - sw) // 2
+                    self.screen.blit(sil, (gx, 0))
+                # Word-wrapped narration text
+                entry = self._DC_NARRATION[self._dc_narr_index]
+                is_thrylos = entry["speaker"] == "thrylos"
+                text_color = (220, 210, 180) if is_thrylos else (200, 200, 190)
+                max_w = self.native_w - 120
+                lines = []
+                for paragraph in entry["text"].split("\n"):
+                    words = paragraph.split()
+                    cur = ""
+                    for w in words:
+                        test = (cur + " " + w).strip()
+                        if self.small_font.size(test)[0] > max_w:
+                            if cur:
+                                lines.append(cur)
+                            cur = w
+                        else:
+                            cur = test
+                    if cur:
+                        lines.append(cur)
+                line_h = self.small_font.get_linesize()
+                total_h = line_h * len(lines)
+                base_y = (self.native_h - total_h) // 2
+                for i, line in enumerate(lines):
+                    surf = self.small_font.render(line, True, text_color)
+                    surf.set_alpha(narr_alpha)
+                    lx = (self.native_w - surf.get_width()) // 2
+                    self.screen.blit(surf, (lx, base_y + i * line_h))
+                # "Click to continue" hint
+                if narr_alpha >= 200:
+                    hint = self.small_font.render("Click to continue...", True, (140, 130, 110))
+                    pulse = int(80 + 60 * math.sin(self._dc_timer * 3))
+                    hint.set_alpha(pulse)
+                    hx = (self.native_w - hint.get_width()) // 2
+                    hy = self.native_h - hint.get_height() - 30
+                    self.screen.blit(hint, (hx, hy))
+
+            # Dark overlay + god silhouette + "Kill it." for non-narration phases
+            elif ga > 0:
                 ov = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
                 ov.fill((0, 0, 0, ga // 2))
                 self.screen.blit(ov, (0, 0))
@@ -3474,25 +3633,24 @@ class Game:
                 sil.set_alpha(ga)
                 gx = (self.native_w - sw) // 2
                 self.screen.blit(sil, (gx, 0))
-                # "Kill it." message
-                msg = self.font.render("Kill it.", True, (220, 210, 180))
+                # "KILL IT." message
+                msg = self.font.render("KILL IT.", True, (220, 210, 180))
                 msg.set_alpha(ga)
                 mx = (self.native_w - msg.get_width()) // 2
-                my = self.native_h - msg.get_height() - 60
+                my = (self.native_h - msg.get_height()) // 2
                 self.screen.blit(msg, (mx, my))
             # Dragon fade during kill animation
-            dc_phase = getattr(self, '_dc_phase', '')
             if dc_phase == "kill_anim":
                 da = getattr(self, '_dc_dragon_alpha', 255)
                 if da < 255:
-                    # Redraw dragon with reduced alpha by overlaying dark
                     d = self._dc_dragon
-                    dx = d.pos[0] - TILE
-                    dy = d.pos[1] - TILE + UI_H
-                    ds = TILE * 3
-                    dark = pygame.Surface((ds, ds), pygame.SRCALPHA)
-                    dark.fill((0, 0, 0, 255 - da))
-                    self.screen.blit(dark, (dx, dy))
+                    if d.anim:
+                        d.anim.flip_x = d.facing_right
+                        img = d.anim.image().copy()
+                        img.set_alpha(da)
+                        sx = d.pos[0] - TILE
+                        sy = d.pos[1] - TILE + UI_H
+                        self.screen.blit(img, (sx, sy))
                 # Draw slash VFX
                 sl = getattr(self, '_dc_slash', None)
                 if sl and not sl.done:
@@ -3591,6 +3749,110 @@ class Game:
             self.screen.blit(vic_text, vic_text.get_rect(
                 center=(self.native_w // 2, self.native_h // 3)))
 
+        # Opening narration screen
+        if self.phase == "opening":
+            # Draw level 1 background with dark shadow
+            self.screen.fill((40, 40, 40))
+            for layer in self._floor_layers_scaled:
+                self.screen.blit(layer, (0, UI_H))
+            shadow = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+            shadow.fill((0, 0, 0, 160))
+            self.screen.blit(shadow, (0, 0))
+            narr_alpha = int(getattr(self, '_op_alpha', 0))
+            ga = getattr(self, '_op_god_alpha', 0)
+            # God silhouette for Thrylos lines
+            if ga > 0:
+                ov = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+                ov.fill((0, 0, 0, ga // 2))
+                self.screen.blit(ov, (0, 0))
+                sprite_name = "God_commanding.png"
+                if sprite_name not in self._god_sprite_cache:
+                    self._god_sprite_cache[sprite_name] = pygame.image.load(
+                        os.path.join(ASSET_DIR, sprite_name)).convert_alpha()
+                raw = self._god_sprite_cache[sprite_name]
+                img_scale = self.native_h / raw.get_height()
+                sw = int(raw.get_width() * img_scale)
+                sh = self.native_h
+                god_img = pygame.transform.scale(raw, (sw, sh))
+                sil = pygame.Surface((sw, sh), pygame.SRCALPHA)
+                sil.blit(god_img, (0, 0))
+                sil.fill((0, 0, 0, 255), special_flags=pygame.BLEND_RGB_MIN)
+                sil.set_alpha(ga)
+                gx = (self.native_w - sw) // 2
+                self.screen.blit(sil, (gx, 0))
+            # Word-wrapped narration text
+            entry = self._OPENING_NARRATION[self._op_index]
+            is_thrylos = entry["speaker"] == "thrylos"
+            text_color = (220, 210, 180) if is_thrylos else (200, 200, 190)
+            max_w = self.native_w - 120
+            lines = []
+            for paragraph in entry["text"].split("\n"):
+                words = paragraph.split()
+                cur = ""
+                for w in words:
+                    test = (cur + " " + w).strip()
+                    if self.small_font.size(test)[0] > max_w:
+                        if cur:
+                            lines.append(cur)
+                        cur = w
+                    else:
+                        cur = test
+                if cur:
+                    lines.append(cur)
+            line_h = self.small_font.get_linesize()
+            total_h = line_h * len(lines)
+            base_y = (self.native_h - total_h) // 2
+            for i, line in enumerate(lines):
+                surf = self.small_font.render(line, True, text_color)
+                surf.set_alpha(narr_alpha)
+                lx = (self.native_w - surf.get_width()) // 2
+                self.screen.blit(surf, (lx, base_y + i * line_h))
+            # "Click to continue" hint
+            if narr_alpha >= 200:
+                hint = self.small_font.render("Click to continue...", True, (140, 130, 110))
+                pulse = int(80 + 60 * math.sin(self._op_timer * 3))
+                hint.set_alpha(pulse)
+                hx = (self.native_w - hint.get_width()) // 2
+                hy = self.native_h - hint.get_height() - 30
+                self.screen.blit(hint, (hx, hy))
+
+        # Main menu screen
+        if self.phase == "menu":
+            self.screen.fill((40, 40, 40))
+            for layer in self._floor_layers_scaled:
+                self.screen.blit(layer, (0, UI_H))
+            shadow = pygame.Surface((self.native_w, self.native_h), pygame.SRCALPHA)
+            shadow.fill((0, 0, 0, 120))
+            self.screen.blit(shadow, (0, 0))
+            # Title tablet — full UI area, extended 5px taller to cover gap
+            menu_tab_h = UI_H + 10
+            menu_tab = pygame.transform.smoothscale(self._tablet_img_raw, (self.native_w, menu_tab_h))
+            self.screen.blit(menu_tab, (0, 0))
+            # Title text
+            title_surf = self.title_font.render("The Prophecy of Kaironth", True, (90, 72, 25))
+            tx = (self.native_w - title_surf.get_width()) // 2
+            ty = (menu_tab_h - title_surf.get_height()) // 2
+            self.screen.blit(title_surf, (tx, ty))
+            # Play button — smaller stone tablet
+            btn_w = int(self.native_w * 0.25)
+            btn_h = int(self.UI_HEIGHT * 0.3)
+            play_tab = pygame.transform.smoothscale(self._tablet_img_raw, (btn_w, btn_h))
+            btn_x = (self.native_w - btn_w) // 2
+            btn_y = (self.native_h - btn_h) // 2
+            self._menu_play_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
+            # Hover glow
+            mpos = self._screen_to_native(pygame.mouse.get_pos())
+            hovering = self._menu_play_rect.collidepoint(mpos)
+            if hovering:
+                glow = pygame.Surface((btn_w, btn_h), pygame.SRCALPHA)
+                glow.fill((255, 220, 140, 35))
+                play_tab.blit(glow, (0, 0))
+            self.screen.blit(play_tab, (btn_x, btn_y))
+            play_surf = self.font.render("Play", True, (60, 50, 40))
+            px = (self.native_w - play_surf.get_width()) // 2
+            py = btn_y + (btn_h - play_surf.get_height()) // 2
+            self.screen.blit(play_surf, (px, py))
+
         # Scale internal surface to fit the resizable window
         dw, dh = self.display.get_size()
         scale = min(dw / self.native_w, dh / self.native_h)
@@ -3617,6 +3879,20 @@ class Game:
                     if event.type == pygame.QUIT:
                         running = False
                         break
+                    # Main menu play button
+                    if event.type == pygame.MOUSEBUTTONDOWN and self.phase == "menu":
+                        mpos = self._screen_to_native(event.pos)
+                        if hasattr(self, '_menu_play_rect') and self._menu_play_rect.collidepoint(mpos):
+                            self._start_opening()
+                    # Opening narration advance
+                    if event.type == pygame.MOUSEBUTTONDOWN and self.phase == "opening" \
+                            and getattr(self, '_op_alpha', 0) >= 200:
+                        self._advance_opening()
+                    # Dragon choice narration advance
+                    if event.type == pygame.MOUSEBUTTONDOWN and self.phase == "dragon_choice" \
+                            and self._dc_phase == "narration" \
+                            and getattr(self, '_dc_narr_alpha', 0) >= 200:
+                        self._advance_narration()
                     # Dragon choice buttons
                     if event.type == pygame.MOUSEBUTTONDOWN and self.phase == "dragon_choice" \
                             and self._dc_phase == "buttons":
